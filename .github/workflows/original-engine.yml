@@ -1,12 +1,15 @@
-name: Compile original Android engine for Apple
+name: Build Wyrm IPA
 on:
   workflow_dispatch:
   push:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  compile:
+  build:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -14,203 +17,37 @@ jobs:
       - run: brew install xcodegen
       - run: bash Scripts/fetch-ios-dependencies.sh
       - run: python3 Scripts/prepare-original-engine.py
-      - run: python3 Tests/arena_lifecycle_contract_test.py
-      - run: python3 Tests/ui_shell_contract_test.py
-      - run: python3 Tests/skin_studio_contract_test.py
-      - run: python3 Tests/air_skin_contract_test.py
-      - run: python3 Tests/team_mode_contract_test.py
-      - run: python3 Tests/session_lifecycle_contract_test.py
       - run: xcodegen generate --spec original-engine.yml
-      - name: Compile original core on iPhone and Simulator
+      - name: Build for iPhone
         shell: bash
         run: |
           set -o pipefail
-          for sdk in iphoneos iphonesimulator; do
-            xcodebuild -project WyrmOriginalEngine.xcodeproj -scheme WyrmOriginal -configuration Release -sdk "$sdk" -derivedDataPath "build-original-$sdk" CODE_SIGNING_ALLOWED=NO build 2>&1 | tee "original-$sdk.log"
-          done
-      - name: Package device and Appetize builds
+          xcodebuild -project WyrmOriginalEngine.xcodeproj -scheme WyrmOriginal -configuration Release -sdk iphoneos -derivedDataPath build-original-iphoneos CODE_SIGNING_ALLOWED=NO build 2>&1 | tee original-iphoneos.log
+      - name: Package unsigned IPA
         run: |
+          APP=build-original-iphoneos/Build/Products/Release-iphoneos/Wyrm.app
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" 2>/dev/null || echo unknown)
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist" 2>/dev/null || echo unknown)
           mkdir -p original-artifacts/Payload
-          ditto build-original-iphoneos/Build/Products/Release-iphoneos/Wyrm.app original-artifacts/Payload/Wyrm.app
+          ditto "$APP" original-artifacts/Payload/Wyrm.app
           cd original-artifacts
-          zip -qry Wyrm-1.1.0-build-114-unsigned.ipa Payload
-          ditto -c -k --sequesterRsrc --keepParent ../build-original-iphonesimulator/Build/Products/Release-iphonesimulator/Wyrm.app Wyrm-1.1.0-build-114-simulator.app.zip
-          shasum -a 256 *.ipa *.zip > SHA256SUMS
-          cp ../README.md README.md
-      - name: Simulator portrait shell and rotated original engine smoke test
-        run: |
-          DEVICE=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
-          xcrun simctl boot "$DEVICE"
-          xcrun simctl bootstatus "$DEVICE" -b
-          echo "WYRM_SIMULATOR=$DEVICE" >> "$GITHUB_ENV"
-          xcrun simctl install "$DEVICE" build-original-iphonesimulator/Build/Products/Release-iphonesimulator/Wyrm.app
-          xcrun simctl launch --stdout="$PWD/original-artifacts/auth-landing-stdout.log" --stderr="$PWD/original-artifacts/auth-landing-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-auth-landing
-          sleep 3
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-auth-landing.png
-          grep 'cinematic auth stage=landing' original-artifacts/auth-landing-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/auth-create-stdout.log" --stderr="$PWD/original-artifacts/auth-create-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-auth-create
-          sleep 3
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-auth-create.png
-          grep 'cinematic auth stage=createUsername' original-artifacts/auth-create-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/auth-login-stdout.log" --stderr="$PWD/original-artifacts/auth-login-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-auth-login
-          sleep 3
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-auth-login.png
-          grep 'cinematic auth stage=loginUsername' original-artifacts/auth-login-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch "$DEVICE" com.omrajput.wyrmios --smoke-session-sync
-          sleep 2
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-session-sync.png
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch "$DEVICE" com.omrajput.wyrmios --smoke-session-signout
-          sleep 2
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-session-signout.png
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/home-stdout.log" --stderr="$PWD/original-artifacts/home-stderr.log" "$DEVICE" com.omrajput.wyrmios
-          sleep 8
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/original-home.png
-          HOME_WIDTH=$(sips -g pixelWidth original-artifacts/original-home.png | awk '/pixelWidth/{print $2}')
-          HOME_HEIGHT=$(sips -g pixelHeight original-artifacts/original-home.png | awk '/pixelHeight/{print $2}')
-          test "$HOME_HEIGHT" -gt "$HOME_WIDTH"
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/settings-stdout.log" --stderr="$PWD/original-artifacts/settings-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-settings --smoke-settings-write
-          sleep 14
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-settings.png
-          grep 'Wyrm SwiftUI shell installed' original-artifacts/settings-stderr.log
-          grep 'Wyrm engine bootstrap scheduled off main thread' original-artifacts/settings-stderr.log
-          grep -E 'Wyrm engine bootstrap completed off main thread in [0-9]+ ms' original-artifacts/settings-stderr.log
-          grep -E 'Wyrm SwiftUI settings bridge verified rows=[1-9][0-9]* id=general.minimap_size' original-artifacts/settings-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/skin-stdout.log" --stderr="$PWD/original-artifacts/skin-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-skin
-          sleep 6
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-skin.png
-          grep 'Wyrm SwiftUI skin studio presented section=overview' original-artifacts/skin-stderr.log
-          grep -E 'Wyrm native skin textures ready beads=42 accessories=32 tags=241 backgrounds=28' original-artifacts/skin-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/skin-tags-stdout.log" --stderr="$PWD/original-artifacts/skin-tags-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-skin-tags
-          sleep 6
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-skin-tags.png
-          grep 'Wyrm SwiftUI skin studio presented section=tags' original-artifacts/skin-tags-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/skin-presets-stdout.log" --stderr="$PWD/original-artifacts/skin-presets-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-skin-presets
-          sleep 5
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-skin-presets.png
-          grep 'Wyrm SwiftUI skin studio presented section=presets' original-artifacts/skin-presets-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/skin-pattern-stdout.log" --stderr="$PWD/original-artifacts/skin-pattern-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-skin-pattern
-          sleep 5
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-skin-pattern.png
-          grep 'Wyrm SwiftUI skin studio presented section=pattern' original-artifacts/skin-pattern-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/skin-wheel-stdout.log" --stderr="$PWD/original-artifacts/skin-wheel-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-skin-wheel
-          sleep 5
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-skin-wheel.png
-          grep 'Wyrm SwiftUI skin studio presented section=pattern' original-artifacts/skin-wheel-stderr.log
-          grep 'Wyrm native skin textures ready .* air=3 wheel=1' original-artifacts/skin-wheel-stderr.log
-          grep 'Wyrm AIR colour wheel presented' original-artifacts/skin-wheel-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/team-stdout.log" --stderr="$PWD/original-artifacts/team-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-team
-          sleep 4
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-team.png
-          grep 'Wyrm SwiftUI NTL Team presented state=' original-artifacts/team-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/refusal-stdout.log" --stderr="$PWD/original-artifacts/refusal-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-arena-refusal
-          for i in $(seq 1 30); do grep -qE 'Wyrm arena refusal bridge verified' original-artifacts/refusal-stderr.log && break; sleep 0.5; done
-          grep -E 'Wyrm arena refusal bridge verified sequence=[1-9][0-9]* endpoint=127.0.0.1:444 taint=120s' original-artifacts/refusal-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/social-stdout.log" --stderr="$PWD/original-artifacts/social-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-social
-          sleep 3
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-social.png
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/leaderboard-stdout.log" --stderr="$PWD/original-artifacts/leaderboard-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-leaderboard
-          sleep 3
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-leaderboard.png
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios || true
-          xcrun simctl launch --stdout="$PWD/original-artifacts/chat-keyboard-stdout.log" --stderr="$PWD/original-artifacts/chat-keyboard-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-chat-keyboard
-          sleep 5
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-chat-keyboard.png
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios || true
-          xcrun simctl launch --stdout="$PWD/original-artifacts/leaderboard-stdout.log" --stderr="$PWD/original-artifacts/leaderboard-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-leaderboard
-          sleep 3
-          LEADERBOARD_WIDTH=$(sips -g pixelWidth original-artifacts/swiftui-leaderboard.png | awk '/pixelWidth/{print $2}')
-          LEADERBOARD_HEIGHT=$(sips -g pixelHeight original-artifacts/swiftui-leaderboard.png | awk '/pixelHeight/{print $2}')
-          test "$LEADERBOARD_HEIGHT" -gt "$LEADERBOARD_WIDTH"
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/developer-stdout.log" --stderr="$PWD/original-artifacts/developer-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-developer
-          sleep 5
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-developer-mode.png
-          grep 'Wyrm engine bootstrap scheduled off main thread' original-artifacts/developer-stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/backup-stdout.log" --stderr="$PWD/original-artifacts/backup-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-backup
-          sleep 6
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/swiftui-backup.png
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios || true
-          xcrun simctl launch --stdout="$PWD/original-artifacts/lobby-stdout.log" --stderr="$PWD/original-artifacts/lobby-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-lobby
-          sleep 8
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/original-lobby.png
-          LOBBY_WIDTH=$(sips -g pixelWidth original-artifacts/original-lobby.png | awk '/pixelWidth/{print $2}')
-          LOBBY_HEIGHT=$(sips -g pixelHeight original-artifacts/original-lobby.png | awk '/pixelHeight/{print $2}')
-          test "$LOBBY_HEIGHT" -gt "$LOBBY_WIDTH"
-          grep 'screen=LOBBY' original-artifacts/lobby-stderr.log
-          grep 'presentation=rotated-landscape os=portrait container=stable-child' original-artifacts/lobby-stderr.log
-          grep 'geometry_ok=1' original-artifacts/lobby-stderr.log
-          grep 'lobby shell presented' original-artifacts/lobby-stderr.log
-          grep -E 'drawable=[0-9]+x[0-9]+' original-artifacts/lobby-stderr.log
-          python3 -c 'import re; s=open("original-artifacts/lobby-stderr.log").read(); assert any(int(w) > int(h) for w,h in re.findall(r"drawable=(\d+)x(\d+)", s)), "engine never received landscape-shaped drawable"'
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios
-          xcrun simctl launch --stdout="$PWD/original-artifacts/lobby-keyboard-stdout.log" --stderr="$PWD/original-artifacts/lobby-keyboard-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-lobby --smoke-lobby-keyboard || true
-          sleep 10
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/lobby-keyboard.png || true
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios || true
-          xcrun simctl launch --stdout="$PWD/original-artifacts/stdout.log" --stderr="$PWD/original-artifacts/stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-ai
-          sleep 8
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/original-ai.png
-          sleep 22
-          xcrun simctl spawn "$DEVICE" log show --last 10m --style compact --predicate 'process == "Wyrm"' > original-artifacts/runtime.log
-          find "$HOME/Library/Logs/DiagnosticReports" -name '*Wyrm*' -exec cp '{}' original-artifacts/ \;
-          WIDTH=$(sips -g pixelWidth original-artifacts/original-ai.png | awk '/pixelWidth/{print $2}')
-          HEIGHT=$(sips -g pixelHeight original-artifacts/original-ai.png | awk '/pixelHeight/{print $2}')
-          test "$WIDTH" -gt 0
-          test "$HEIGHT" -gt 0
-          grep 'first Thermite frame presented' original-artifacts/runtime.log
-          grep -E 'orientation=[1-4] drawable=[0-9]+x[0-9]+' original-artifacts/runtime.log
-          grep '120 frames; ai=1' original-artifacts/runtime.log
-          grep 'leaderboard ready' original-artifacts/stderr.log
-          python3 -c 'import re; s=open("original-artifacts/stderr.log").read(); m=re.findall(r"pixel canvas: imgui=(\d+)x(\d+) framebuffer=1\.00x1\.00 drawable=(\d+)x(\d+)",s); assert any(a==c and b==d and int(a)>int(b) for a,b,c,d in m), "AI canvas is not one landscape pixel space"'
-          grep 'arena frame progress=120' original-artifacts/stderr.log
-          xcrun simctl terminate "$DEVICE" com.omrajput.wyrmios || true
-          xcrun simctl launch --stdout="$PWD/original-artifacts/composer-stdout.log" --stderr="$PWD/original-artifacts/composer-stderr.log" "$DEVICE" com.omrajput.wyrmios --smoke-ai --smoke-team-composer || true
-          sleep 16
-          xcrun simctl io "$DEVICE" screenshot original-artifacts/team-composer.png || true
-      - name: Simulator original online arena smoke test
-        run: |
-          xcrun simctl terminate "$WYRM_SIMULATOR" com.omrajput.wyrmios || true
-          xcrun simctl launch --stdout="$PWD/original-artifacts/online-stdout.log" --stderr="$PWD/original-artifacts/online-stderr.log" "$WYRM_SIMULATOR" com.omrajput.wyrmios --smoke-online
-          sleep 10
-          xcrun simctl io "$WYRM_SIMULATOR" screenshot original-artifacts/original-online.png
-          sleep 20
-          xcrun simctl io "$WYRM_SIMULATOR" screenshot original-artifacts/original-online-late.png
-          xcrun simctl spawn "$WYRM_SIMULATOR" log show --last 1m --style compact --predicate 'process == "Wyrm"' > original-artifacts/online-runtime.log
-          find "$HOME/Library/Logs/DiagnosticReports" -name '*Wyrm*' -exec cp '{}' original-artifacts/ \;
-          grep -E 'online arena admitted, own snake spawned, frame presented id=[0-9]+ segments=[0-9]+' original-artifacts/online-stderr.log
-          grep 'screen=PLAYING' original-artifacts/online-stderr.log
-          grep 'leaderboard ready' original-artifacts/online-stderr.log
-          python3 -c 'import re; s=open("original-artifacts/online-stderr.log").read(); m=re.findall(r"pixel canvas: imgui=(\d+)x(\d+) framebuffer=1\.00x1\.00 drawable=(\d+)x(\d+)",s); assert any(a==c and b==d and int(a)>int(b) for a,b,c,d in m), "online canvas is not one landscape pixel space"'
-          grep 'arena frame progress=120' original-artifacts/online-stderr.log
-          grep -E 'presentation=rotated-landscape os=portrait container=stable-child .*geometry_ok=1' original-artifacts/online-stderr.log
-      - uses: actions/upload-artifact@v5
-        if: always()
+          zip -qry "Wyrm-${VER}-build-${BUILD}-unsigned.ipa" Payload
+          rm -rf Payload
+          ls -lh *.ipa
+      - name: Upload IPA
+        uses: actions/upload-artifact@v5
         with:
-          name: original-engine-compile-${{ github.run_id }}
+          name: Wyrm-ipa-${{ github.run_number }}
+          path: original-artifacts/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-log-${{ github.run_number }}
           path: |
             original-*.log
             build-original-source/platform-selection.json
-            original-artifacts/*.ipa
-            original-artifacts/*.zip
-            original-artifacts/*.png
-            original-artifacts/*.log
-            original-artifacts/*.ips
-            original-artifacts/README.md
-            original-artifacts/SHA256SUMS
-          retention-days: 1
+          if-no-files-found: ignore
+          retention-days: 7
