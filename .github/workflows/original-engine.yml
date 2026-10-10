@@ -17,6 +17,7 @@ jobs:
       - run: brew install xcodegen
       - run: bash Scripts/fetch-ios-dependencies.sh
       - run: python3 Scripts/prepare-original-engine.py
+      - run: python3 Scripts/wyrm-tag-overrides.py
       - run: xcodegen generate --spec original-engine.yml
       - name: Build for iPhone
         shell: bash
