@@ -257,7 +257,7 @@ final class WyrmCustomTagStore: ObservableObject {
         if let id = index.activeID, let item = item(id), let stored = storedImage(for: id) {
             let key = "\(id)#\(item.turns)"
             var ready = lastSentKey == key
-            if !ready, let data = stored.pngData() {
+            if !ready, let data = Self.engineData(stored) ?? stored.pngData() {
                 ready = data.withUnsafeBytes { raw -> Bool in
                     guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
                     return WyrmCustomTagSetImage(base, data.count)
@@ -325,6 +325,157 @@ final class WyrmCustomTagStore: ObservableObject {
         return context.makeImage()
     }
 
+    // MARK: Engine picture
+
+    /// The picture as PNG bytes for the engine, with the colour of its
+    /// see-through pixels filled in from their neighbours. A picture drawn
+    /// through Core Graphics keeps no colour where it is fully see-through
+    /// (it reads back black), and the engine's smooth scaling then blends that
+    /// black into every edge: a dark halo, or a black ground behind a soft
+    /// shadow. The PNG is written here, uncompressed, because the system
+    /// encoder may premultiply it again and lose the colour.
+    private static func engineData(_ image: UIImage) -> Data? {
+        guard let cg = image.cgImage, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return nil }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = px.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                          bytesPerRow: w * 4, space: space,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drawn else { return nil }
+
+        // To straight alpha, remembering which pixels can be seen at all and
+        // the average colour of those.
+        var filled = [Bool](repeating: false, count: w * h)
+        var sumR = 0.0, sumG = 0.0, sumB = 0.0, sumA = 0.0
+        for i in 0..<(w * h) {
+            let a = Int(px[i * 4 + 3])
+            if a == 0 { continue }
+            filled[i] = true
+            for c in 0..<3 {
+                px[i * 4 + c] = UInt8(min(255, (Int(px[i * 4 + c]) * 255 + a / 2) / a))
+            }
+            sumR += Double(px[i * 4]) * Double(a)
+            sumG += Double(px[i * 4 + 1]) * Double(a)
+            sumB += Double(px[i * 4 + 2]) * Double(a)
+            sumA += Double(a)
+        }
+
+        // Spread the colour of the visible edge outwards, a pixel a pass.
+        for _ in 0..<8 {
+            var next = px
+            var nextFilled = filled
+            var changed = false
+            for y in 0..<h {
+                for x in 0..<w {
+                    let i = y * w + x
+                    if filled[i] { continue }
+                    var r = 0, g = 0, b = 0, n = 0
+                    for dy in -1...1 {
+                        for dx in -1...1 {
+                            if dx == 0 && dy == 0 { continue }
+                            let nx = x + dx, ny = y + dy
+                            if nx < 0 || ny < 0 || nx >= w || ny >= h { continue }
+                            let j = ny * w + nx
+                            if filled[j] {
+                                r += Int(px[j * 4]); g += Int(px[j * 4 + 1]); b += Int(px[j * 4 + 2])
+                                n += 1
+                            }
+                        }
+                    }
+                    if n > 0 {
+                        next[i * 4] = UInt8(r / n)
+                        next[i * 4 + 1] = UInt8(g / n)
+                        next[i * 4 + 2] = UInt8(b / n)
+                        nextFilled[i] = true
+                        changed = true
+                    }
+                }
+            }
+            px = next
+            filled = nextFilled
+            if !changed { break }
+        }
+
+        // Whatever is left, far from any edge, takes the picture's average.
+        if sumA > 0 {
+            let ar = UInt8(min(255, sumR / sumA))
+            let ag = UInt8(min(255, sumG / sumA))
+            let ab = UInt8(min(255, sumB / sumA))
+            for i in 0..<(w * h) where !filled[i] {
+                px[i * 4] = ar
+                px[i * 4 + 1] = ag
+                px[i * 4 + 2] = ab
+            }
+        }
+        return pngBytes(px, width: w, height: h)
+    }
+
+    private static let crcTable: [UInt32] = (0..<256).map { n -> UInt32 in
+        var c = UInt32(n)
+        for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1) }
+        return c
+    }
+
+    private static func crc32(_ bytes: [UInt8]) -> UInt32 {
+        var c: UInt32 = 0xFFFFFFFF
+        for byte in bytes { c = crcTable[Int((c ^ UInt32(byte)) & 0xFF)] ^ (c >> 8) }
+        return c ^ 0xFFFFFFFF
+    }
+
+    private static func bigEndian(_ v: UInt32) -> [UInt8] {
+        [UInt8((v >> 24) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)]
+    }
+
+    private static func appendChunk(_ out: inout [UInt8], _ kind: String, _ body: [UInt8]) {
+        var typed = [UInt8](kind.utf8)
+        typed.append(contentsOf: body)
+        out.append(contentsOf: bigEndian(UInt32(body.count)))
+        out.append(contentsOf: typed)
+        out.append(contentsOf: bigEndian(crc32(typed)))
+    }
+
+    /// 8-bit RGBA, straight alpha, stored (uncompressed) deflate blocks.
+    private static func pngBytes(_ px: [UInt8], width w: Int, height h: Int) -> Data {
+        var raw = [UInt8]()
+        raw.reserveCapacity((w * 4 + 1) * h)
+        for y in 0..<h {
+            raw.append(0)
+            raw.append(contentsOf: px[(y * w * 4)..<((y + 1) * w * 4)])
+        }
+        var a: UInt32 = 1, b: UInt32 = 0
+        for byte in raw {
+            a = (a + UInt32(byte)) % 65521
+            b = (b + a) % 65521
+        }
+        var z: [UInt8] = [0x78, 0x01]
+        var position = 0
+        while position < raw.count {
+            let n = min(65535, raw.count - position)
+            z.append(position + n >= raw.count ? 1 : 0)
+            z.append(UInt8(n & 0xFF))
+            z.append(UInt8((n >> 8) & 0xFF))
+            z.append(UInt8(~n & 0xFF))
+            z.append(UInt8((~n >> 8) & 0xFF))
+            z.append(contentsOf: raw[position..<(position + n)])
+            position += n
+        }
+        z.append(contentsOf: bigEndian((b << 16) | a))
+
+        var header = bigEndian(UInt32(w))
+        header.append(contentsOf: bigEndian(UInt32(h)))
+        header.append(contentsOf: [8, 6, 0, 0, 0])
+        var out: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        appendChunk(&out, "IHDR", header)
+        appendChunk(&out, "IDAT", z)
+        appendChunk(&out, "IEND", [])
+        return Data(out)
+    }
+
     /// A starting pair of rope colours from the picture: a darker shade of its
     /// average for the thick line and a lighter one for the tip, as Wyrm's own
     /// tags pair them.
@@ -383,6 +534,8 @@ struct WyrmCustomTagImagePicker: UIViewControllerRepresentable {
         var configuration = PHPickerConfiguration()
         configuration.filter = .images
         configuration.selectionLimit = 1
+        // The picture as it is, not a converted copy that may have lost its see-through parts.
+        configuration.preferredAssetRepresentationMode = .current
         let controller = PHPickerViewController(configuration: configuration)
         controller.delegate = context.coordinator
         return controller
@@ -400,6 +553,16 @@ struct WyrmCustomTagImagePicker: UIViewControllerRepresentable {
             guard let provider = results.first?.itemProvider,
                   provider.canLoadObject(ofClass: UIImage.self) else {
                 DispatchQueue.main.async { self.onPick(nil) }
+                return
+            }
+            // A PNG is read from its own bytes: asking for a UIImage instead can
+            // hand back a flattened copy whose see-through parts have turned black.
+            let png = "public.png"
+            if provider.hasItemConformingToTypeIdentifier(png) {
+                provider.loadDataRepresentation(forTypeIdentifier: png) { data, _ in
+                    let image = data.flatMap { UIImage(data: $0) }
+                    DispatchQueue.main.async { self.onPick(image) }
+                }
                 return
             }
             provider.loadObject(ofClass: UIImage.self) { object, _ in
